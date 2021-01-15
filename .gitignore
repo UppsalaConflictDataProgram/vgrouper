@@ -1,0 +1,9 @@
+*.py[cod]
+__pycache__/
+venv/
+.vim/
+.mypy_cache/
+
+.env
+*.sqlite
+mockdata.py
