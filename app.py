@@ -5,12 +5,16 @@ It reflects information from the "main db", making groups of columns that can be
 used for further querying.
 """
 import os
-from typing import Union
+from typing import Union,List,Optional,Tuple
 import enum
 import contextlib
+from contextlib import closing
 
 import fastapi
 from fastapi import Response,Request
+from starlette.responses import JSONResponse
+
+import requests
 
 from sqlalchemy import create_engine,Column,String,Integer,Enum,ForeignKey,Table
 from sqlalchemy.ext.declarative import declarative_base
@@ -23,19 +27,36 @@ from environs import Env
 env = Env()
 env.read_env()
 
-app = fastapi.FastAPI()
 engine = create_engine("sqlite:///db.sqlite")
-
 Base = declarative_base()
-
 Session = sessionmaker(bind=engine)
 
-class UnitOfAnalysis(enum.Enum):
+# ========================================================
+
+def exists_remotely(table_name,column_name=None):
     """
-    Enum representing the current valid units of analysis
+    Check if table / table column exists in the DB
     """
-    priogrid_cell = "pg"
-    country = "ctry"
+    path = [env("BROKER_URL"),"table",table_name]
+    if column_name is not None:
+        path.append(column_name)
+
+    result = requests.get(os.path.join(*path))
+    if result.status_code == 404:
+        return False
+    elif result.status_code == 200:
+        return True
+    else:
+        raise ValueError(f"Unexpected status code from broker: {result.status_code}")
+
+def hyperlink(request:Request,path:str,key:Union[str,int])->str:
+    """
+    Composes a hyperlink from the provided components
+    """
+    base = f"{request.url.scheme}://{request.url.hostname}:{request.url.port}"
+    return os.path.join(base,path,key)
+
+# ========================================================
 
 class MainTable(Base):
     """
@@ -43,15 +64,16 @@ class MainTable(Base):
     """
     __tablename__="maintable"
     name = Column(String,primary_key=True)
-    uoa = Column(Enum(UnitOfAnalysis),nullable=False)
-    variables = relationship("MainVariable",back_populates="table")
+    #uoa = Column(Enum(UnitOfAnalysis),nullable=False)
+    variables = relationship("MainColumn",back_populates="table")
+    querysets = relationship("QuerySet",back_populates="table")
 
-class MainVariable(Base):
+class MainColumn(Base):
     """
     Entries corresponding to columns in the relevant tables in the DB.
     Constraint checking against columns is hard, so i've instead
-    opted to make this system self-healing, meaning it fails gracefully
-    if a column does not actually exist in the information_schema.
+    opted to make this system self-healing, meaning it does a consistency
+    check whenever a queryset is retrieved.
     """
     __tablename__ = "variable"
 
@@ -65,7 +87,9 @@ class MainVariable(Base):
         """
         Check if a variable is available remotely
         """
-        return True
+        url = os.path.join(env("BROKER_URL"),"table",self.table_name,self.name)
+        response = requests.get(url)
+        return response.status_code == 200
 
 class QuerySet(Base):
     """
@@ -76,16 +100,33 @@ class QuerySet(Base):
     #queryset_id = Column(Integer,primary_key=True,autoincrement=True)
     name = Column(String,primary_key=True)
 
-    variables = relationship("MainVariable",secondary="querysets_variables")
+    table_name = Column(String,ForeignKey("maintable.name"))
+    table = relationship("MainTable",back_populates="querysets")
+
+    variables = relationship("MainColumn",secondary="querysets_variables")
+
     def remote_validate(self):
         """
         Check if registered variables are available remotely
         """
+        valid = exists_remotely(self.table_name)
         for variable in self.variables:
-            if variable.remote_validate():
-                pass
-            else:
-                variable.delete()
+            valid &= exists_remotely(self.table_name,variable.name)
+        return valid
+
+    def remote_repair(self):
+        session = Session.object_session(self)
+        if not exists_remotely(self.table_name):
+            session.delete(self)
+            session.commit()
+        else:
+            for variable in self.variables:
+                if variable.remote_validate():
+                    pass
+                else:
+                    sess = Session.object_session(self)
+                    sess.delete(variable)
+                sess.commit()
 
 querysets_variables = Table("querysets_variables",Base.metadata,
         Column("variable_id",Integer,ForeignKey("variable.variable_id")),
@@ -94,36 +135,157 @@ querysets_variables = Table("querysets_variables",Base.metadata,
 
 Base.metadata.create_all(engine)
 
-def hyperlink(request:Request,path:str,key:Union[str,int])->str:
+# ========================================================
+
+class ColumnPost(pydantic.BaseModel):
     """
-    Composes a hyperlink from the provided components
+    A posted column 
     """
-    return os.path.join(request.url.hostname,path,key)
+    name: str
+
+class QuerySetPost(pydantic.BaseModel):
+    """
+    A posted QuerySet
+    """
+    name: str
+    columns: List[ColumnPost]
+    table: str
+
+class QuerySetUpdate(pydantic.BaseModel):
+    """
+    A posted QuerySet
+    """
+    columns: List[ColumnPost]
+
+def validate_qs_post(qs)->Tuple[bool,Optional[JSONResponse]]:
+    try:
+        assert exists_remotely(qs.table)
+    except AssertionError:
+        return False, JSONResponse({"message":f"Table {qs.table} does not exist"},status_code=400)
+
+    if qs.columns is not None:
+        for c in qs.columns:
+            try:
+                assert exists_remotely(qs.table,c.name)
+            except AssertionError:
+                return False, JSONResponse({
+                        "message":f"Column {c.name} does not exist"
+                    },status_code=400)
+
+    return True,None
+
+# ========================================================
+
+app = fastapi.FastAPI()
+
+@app.delete("/queryset/{name}")
+def qset_delete(name:str):
+    with closing(Session()) as sess:
+        existing = sess.query(QuerySet).get(name)
+        if existing is None:
+            return Response(status_code=404)
+        else:
+            sess.delete(existing)
+            sess.commit()
+            return Response(status_code=204)
+
+@app.put("/queryset/{name}")
+def qset_update(request:Request,queryset:QuerySetUpdate,name:str):
+    with closing(Session()) as sess:
+        existing = sess.query(QuerySet).get(name)
+        if not existing:
+            return Response(status_code=404)
+
+        columns = []
+        for column in queryset.columns:
+            try:
+                assert exists_remotely(existing.table_name,column.name)
+            except AssertionError:
+                return JSONResponse({"message":f"Column {column.name} does not exist"},status_code=400)
+
+            column_object = (sess.query(MainColumn)
+                    .filter(
+                        MainColumn.table_name==existing.table_name,
+                        MainColumn.name==column.name)
+                    .first()
+                )
+            if column_object is None:
+                column_object = MainColumn(name=column.name,table = existing.table)
+            columns.append(column_object) 
+
+        existing.variables = columns
+        sess.commit()
+        return Response(status_code=204)
+
+
+@app.post("/queryset/")
+def qset_create(request:Request,queryset:QuerySetPost):
+    with closing(Session()) as sess:
+        exists = sess.query(QuerySet).get(queryset.name) is not None
+        if exists:
+            return Response(status_code=409)
+
+        try:
+            assert exists_remotely(queryset.table_name)
+        except AssertionError:
+            return JSONResponse({"message":f"Table {queryset.table_name} does not exist"},
+                    status_code=400)
+        for c in queryset.columns:
+            try:
+                assert exists_remotely(queryset.table_name,c.name)
+            except AssertionError:
+                return JSONResponse({"message":f"Column {c.name} does not exist"},
+                        status_code=400)
+
+        table = sess.query(MainTable).get(queryset.table)
+        if table is None:
+            table = MainTable(name=queryset.name)
+            sess.add(table)
+
+        columns = []
+        for col in queryset.columns:
+            column = (sess.query(MainColumn)
+                    .filter(MainColumn.name==col.name,MainColumn.table==table)
+                    .first()
+                )
+            if column is None:
+                column = MainColumn(name=col.name,table=table)
+                sess.add(column)
+
+            columns.append(column)
+
+        queryset = QuerySet(
+            name = queryset.name,
+            table_name = queryset.table,
+            variables = columns
+        )
+
+        sess.add(queryset)
+        sess.commit()
+        return {"queryset":hyperlink(request,"queryset",queryset.name)}
+
 
 @app.get("/queryset/{name}")
 def qset_detail(request:Request,name:str):
     """
     Return queryset contents
     """
-    with contextlib.closing(Session()) as sess:
+    with closing(Session()) as sess:
         queryset = sess.query(QuerySet).get(name)
         if queryset is None:
             return Response(status_code=404)
-        else:
-            queryset.remote_validate()
-            variables = [hyperlink(request,"variable",v.name) for v in queryset.variables]
-    return {
-        "name": queryset.name,
-        "variables":variables
-    }
-    #return [VariableResponse.from_object(v) for v in variables] 
+        return {
+            "queryset_name": queryset.name,
+            "table_name": queryset.table_name,
+            "variables":[v.name for v in queryset.variables]
+        }
 
 @app.get("/queryset/")
 def qset_list(request:Request):
     """
     Returns a list of querysets
     """
-    with contextlib.closing(Session()) as sess:
+    with closing(Session()) as sess:
         querysets = sess.query(QuerySet).all()
         serialized = []
         for queryset in querysets:
@@ -133,21 +295,3 @@ def qset_list(request:Request):
                     "variables": len(queryset.variables),
                 })
     return serialized
-
-"""
-@app.get("/variable/{pk}")
-def variable_detail(pk:int):
-    pass
-
-@app.get("/variable/")
-def variable_list():
-    pass
-
-@app.get("/table/{name}")
-def table_detail(name:str):
-    pass
-
-@app.get("/table/")
-def table_list():
-    pass
-"""

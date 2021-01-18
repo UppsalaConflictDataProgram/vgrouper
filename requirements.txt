@@ -14,3 +14,4 @@ uvloop==0.14.0
 numpy==1.19.5
 
 environs==9.3.0
+requests==2.25.1
